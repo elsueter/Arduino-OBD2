@@ -1,0 +1,219 @@
+#include <TinyGPS++.h> 
+#include <GSM.h>
+#include <OBD2UART.h>
+#include <EEPROM.h>
+
+COBD obd;
+
+TinyGPSPlus gps;
+
+GSM gsmAccess(true);
+GSM_SMS sms;
+bool gotLock = false;
+int RPM, LOAD, TEMP;
+
+void outputBitCode(boolean passed){//makes the diagnostic led flash once for true or twice for false
+  if(passed){
+    digitalWrite(12, HIGH);
+    delay(300);
+    digitalWrite(12, LOW);
+  }else{
+    digitalWrite(12, HIGH);
+    delay(300);
+    digitalWrite(12, LOW);
+    delay(300);
+    digitalWrite(12, HIGH);
+    delay(300);
+    digitalWrite(12, LOW);
+  }
+}
+
+void setup(){
+  Serial.begin(9600);
+  Serial1.begin(9600);
+  Serial2.begin(9600);
+  Serial3.begin(115200);
+  pinMode(12, OUTPUT);
+  pinMode(A0, INPUT);//opens all of the serial ports for each of the devices, bluetooth is running at a higher baud rate for sync reasons with android app
+
+  bool temp = true;
+  
+  while(temp){
+      boolean notConnected = true;
+    
+       while(notConnected){
+        Serial.println("Startup Start;");
+        //switches the opening of the gsm startup in order to see what it is doing, this caused a lot of issues because 
+        //if there was not enough power it would not connect at all and not try again, with this switch it gives the ability to try again after a set
+        //time which normally fixes the issue
+        switch(gsmAccess.begin()){
+          case ERROR:
+          Serial.println("Error");
+          outputBitCode(false);
+          break;
+          
+          case IDLE:
+          Serial.println("Idle");
+          outputBitCode(false);
+          break;
+
+          case CONNECTING:
+          Serial.println("Connecting");
+          outputBitCode(false);
+          break;
+          
+          case GSM_READY:
+          Serial.println("Connected");
+          outputBitCode(true);
+          notConnected = false;
+          temp = false;
+          break;
+          
+          default:
+          Serial.println("Something Occured?");
+          break;
+        }
+    }
+  }
+
+  temp = true;
+
+  while(temp){//initialises the OBD connection of the object and sensor
+      obd.begin();
+      Serial.println("OBD Initialised;");
+      temp = false;
+  }
+  
+  Serial.println("Startup End;");
+}
+
+void saveGPS(String str){//saves the gps string that was able to be desiphered to eeprom for next boot in order to speed up the boot times
+  Serial.print("Saving str: ");
+  Serial.println(str);
+  EEPROM.write(0, "R");
+  for(int i = 0; i < str.length(); i++){
+    EEPROM.write(i+1, str.charAt(i));
+  }
+  EEPROM.write(str.length(), "E");
+}
+
+String getGPS(){//geting the last saved gps string to desipher back into co ords again
+  String str = "";
+  if(EEPROM.read(0) == "R"){
+    int i = 1;
+    while(EEPROM.read(i) != "E"){
+      str += EEPROM.read(i);
+      i++;
+    }
+  }
+  Serial.print("EEPROM stuff: ");
+  Serial.println(str);
+  return str;
+}
+
+void getGPSLOC(){//repeats until a satelite lock has been attained and the device knows where it is
+  String GPSstring;
+  while(!gotLock){
+      Serial.println("GPS loop");
+      String GPSstring = getGPS();
+      while (Serial2.available() > 0){
+        char c = Serial2.read();
+        Serial.print(c);
+        GPSstring += c;
+        gps.encode(c);
+      }
+      Serial.println();
+      Serial.print(gps.location.lng(), 6);
+      if(gps.location.lat() != 0 && gps.location.lng() != 0){
+        saveGPS(GPSstring);
+        gotLock = true;
+      }
+      if(GPSstring != ""){
+        for(int i = 0; i < GPSstring.length(); i++){
+          gps.encode(GPSstring.charAt(i));
+        }
+      }
+      delay(1000);
+  }
+}
+
+void checkSMS(){//checks if an sms has been recieved and if so decides how to use it and what to send back
+  if (sms.available())
+  {
+    Serial.println("Checking SMS");
+    char senderNumber[20];
+
+    sms.remoteNumber(senderNumber, 20);
+    
+    String msg = "";
+
+    char c;
+    
+    while(c=sms.read())
+    {
+      msg += c;
+    }
+
+    sms.flush();
+
+    if (msg == "Location"){
+      sms.beginSMS(senderNumber);
+      if(gotLock){
+        sms.print("http://maps.google.com/?q=");
+        sms.print(gps.location.lat(), 6);
+        sms.print(",");
+        sms.print(gps.location.lng(), 6);
+      }else{
+        sms.print("Still getting satellite lock, no GPS data at this time");
+      }
+      sms.endSMS();
+    }else if(msg == "Ping"){
+      sms.beginSMS(senderNumber);
+      sms.print("Here and Working");
+      sms.endSMS();
+    }else if(msg == "Help"){
+      sms.beginSMS(senderNumber);
+      sms.print("Commands: 'Location', 'Help', 'Ping'");
+      sms.endSMS();
+    }else{
+      sms.beginSMS(senderNumber);
+      sms.print("Unknown command, text 'Help' for list of commands");
+      sms.endSMS();
+    }
+  }
+}
+
+void readPIDs()//this function reads PIDs from the obd2 adapter, here i have only got the system to read 3 for the sake of the demonstration to show that it does work, 
+//to make it read more is not much work and is just a case of adding another case here
+{
+  Serial.println("Checking PID's");
+  int value;
+  if (obd.readPID(PID_RPM, value)) {
+    RPM = value;
+  }
+  if (obd.readPID(PID_COOLANT_TEMP, value)) {
+    TEMP = value;
+  }
+  if (obd.readPID(PID_ENGINE_LOAD, value)) {
+    LOAD = value;
+  }
+}
+
+void loop() 
+{
+  Serial.println("Looping");
+  if(!obd.init()){//tries to init the obd device incase the device has been booted without being plugged into a car or the 
+    //car does not provide power through the OBD port when the ignition is off which is set on a car by car basis
+    Serial.println("OBD not initialised;");
+  }else{
+    readPIDs();
+  }
+  getGPSLOC();
+      
+  checkSMS();
+
+  Serial3.println(String(gps.location.lat()) + " " + String(gps.location.lng()) + "," + String(RPM) + "," + String(TEMP) + "," + String(LOAD) + ",");
+  //this is where the data is sent over the bluetooth to the android app which then splits this string and displays it for the user to use as they want
+      
+  delay(1000); // delay
+}
